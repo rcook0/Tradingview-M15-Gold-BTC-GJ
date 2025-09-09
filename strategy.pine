@@ -1,0 +1,261 @@
+// @version=5
+// M15 Gold/BTC/GJ Strategy — full backtest + alerts
+// Features: symbol toggle, session filters (London/NY), manual news blackout windows,
+// MTF H1 confirmation, %ATR SL/TP, break-even + ATR trailing stop, relaxed accuracy control,
+// and alertconditions for entries/exits.
+
+strategy("M15 Gold/BTC/GJ Strategy — v1.0",
+     overlay=true,
+     timeframe="15",
+     initial_capital=10000,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     commission_type=strategy.commission.percent,
+     commission_value=0.02,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Inputs — General
+//──────────────────────────────────────────────────────────────────────────────
+// Symbol toggle (acts as a filter; set to "Any" to allow all)
+symChoice = input.string(
+    title = "Symbol filter",
+    defval = "Any",
+    options = ["Any", "Gold (XAU)", "Bitcoin (BTC)", "GBPJPY (GJ)"])
+
+// Relaxed accuracy (lower values = more permissive). 0.70 per user.
+accuracy = input.float(0.70, "Signal accuracy (0..1)", minval=0.30, maxval=1.00, step=0.05)
+relax    = 1.0 - accuracy
+
+// Position sizing
+riskPct  = input.float(10, "Position size % of equity", minval=0.1, maxval=100)
+strategy.risk.allow_entry_in(strategy.direction.long)
+strategy.risk.allow_entry_in(strategy.direction.short)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Session filters (London / New York)
+//──────────────────────────────────────────────────────────────────────────────
+useSessions = input.bool(true, "Enable session filters")
+// Sessions in exchange timezone by default. Users can change.
+exchTZ      = input.string(syminfo.timezone, "Session timezone")
+// Defaults roughly: London 07:00–12:00, New York 13:30–17:30 (can tweak)
+lonEnable   = input.bool(true, "London session")
+lonSess     = input.session("0700-1200", "London session hours")
+nyEnable    = input.bool(true, "New York session")
+nySess      = input.session("1330-1730", "New York session hours")
+
+inLondon    = time(exchTZ, lonSess)
+inNewYork   = time(exchTZ, nySess)
+passSession = useSessions ? ((lonEnable and inLondon) or (nyEnable and inNewYork)) : true
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Manual news blackout windows (up to 5 ranges). Prevents new entries.
+//──────────────────────────────────────────────────────────────────────────────
+useNewsBlk  = input.bool(true, "Enable manual news blackout windows")
+var int MAX_NEWS = 5
+var bool blockNow = false
+blockNow := false
+for i = 0 to MAX_NEWS - 1
+    blkOn  = input.bool(false, "News window #" + str.tostring(i+1) + " on?")
+    startT = input.time(timestamp("2024-01-01T00:00:00Z"), "Start UTC #" + str.tostring(i+1))
+    endT   = input.time(timestamp("2024-01-01T01:00:00Z"), "End UTC #"   + str.tostring(i+1))
+    inBlk  = time >= startT and time <= endT
+    blockNow := useNewsBlk and blkOn and inBlk ? true : blockNow
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Symbol filter helper (matches common roots)
+//──────────────────────────────────────────────────────────────────────────────
+string t   = syminfo.ticker
+string root= str.upper(syminfo.root)
+hasXAU = str.contains(str.upper(t), "XAU") or str.contains(root, "XAU")
+hasBTC = str.contains(str.upper(t), "BTC") or str.contains(root, "BTC")
+hasGJ  = str.contains(str.upper(t), "GBPJPY") or str.contains(str.upper(t), "GJ")
+
+symPass = switch symChoice
+    "Any"           => true
+    "Gold (XAU)"    => hasXAU
+    "Bitcoin (BTC)" => hasBTC
+    "GBPJPY (GJ)"   => hasGJ
+    => true
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Core indicators (M15)
+//──────────────────────────────────────────────────────────────────────────────
+lenEMAfast = input.int(21,  "EMA fast (M15)")
+lenEMAslow = input.int(200, "EMA slow (M15)")
+emaFast = ta.ema(close, lenEMAfast)
+emaSlow = ta.ema(close, lenEMAslow)
+vwap    = ta.vwap(hlc3)
+
+// Stochastic with relaxed thresholds
+kLen   = input.int(14, "Stoch K length")
+dLen   = input.int(3,  "Stoch D length")
+smooth = input.int(3,  "Stoch smoothing")
+[k, d] = ta.stoch(close, high, low, kLen, smooth, dLen)
+obase = 80.0, obMin = 60.0
+osbase = 20.0, osMax = 40.0
+ob = obase - (obase - obMin) * relax  // e.g., at 0.70 accuracy → relax=0.30 → ob≈74
+os = osbase + (osMax - osbase) * relax // e.g., os≈26
+
+// ATR (M15)
+atrLen = input.int(14, "ATR length (M15)")
+atr    = ta.atr(atrLen)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ MTF H1 confirmation
+//──────────────────────────────────────────────────────────────────────────────
+useMTF   = input.bool(true, "Use H1 confirmation")
+h1LenEMA = input.int(200, "EMA length (H1)")
+h1EMA  = request.ema(close, h1LenEMA, timeframe="60")
+h1Close= request.security(syminfo.tickerid, "60", close)
+h1Slope = ta.linreg(h1EMA, 5, 0) - ta.linreg(h1EMA[1], 5, 0)
+
+// Relax slope requirement
+slopeMinBase = 0.0, slopeMinTight = 0.05
+slopeMin = slopeMinBase - (slopeMinBase - slopeMinTight)*relax  // goes negative slightly if relaxed
+trendUpH1   = h1Close > h1EMA and h1Slope >= slopeMin
+trendDownH1 = h1Close < h1EMA and h1Slope <= -slopeMin
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Entry logic
+// Long bias: price above VWAP & EMA fast > slow; Stoch cross up from oversold.
+// Short bias: price below VWAP & EMA fast < slow; Stoch cross down from overbought.
+// Accuracy relax also widens cross conditions by allowing K near D.
+nearTolBase = 0.0, nearTolMax = 5.0
+nearTol = nearTolBase + (nearTolMax - nearTolBase) * relax
+
+stochCrossUp   = ta.crossover(k, d) and k < os + nearTol
+stochCrossDown = ta.crossunder(k, d) and k > ob - nearTol
+
+bullStructure = close > vwap and emaFast > emaSlow
+bearStructure = close < vwap and emaFast < emaSlow
+
+longCond  = bullStructure and stochCrossUp  and symPass and passSession and not blockNow and (useMTF ? trendUpH1   : true)
+shortCond = bearStructure and stochCrossDown and symPass and passSession and not blockNow and (useMTF ? trendDownH1 : true)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ %ATR Stops/Targets
+//──────────────────────────────────────────────────────────────────────────────
+atrPctSL = input.float(1.0, "%ATR for Stop (e.g., 1.0 = 100% of ATR)", step=0.05, minval=0.1)
+atrPctTP = input.float(2.0, "%ATR for Target (e.g., 2.0 = 200% of ATR)", step=0.05, minval=0.2)
+
+ptValue = strategy.pointvalue
+// Convert ATR distance to price terms (ATR is already in price units on most markets)
+longSL  = close - atr * atrPctSL
+longTP  = close + atr * atrPctTP
+shortSL = close + atr * atrPctSL
+shortTP = close - atr * atrPctTP
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Break-even & Trailing Stop (ATR based)
+//──────────────────────────────────────────────────────────────────────────────
+useBE   = input.bool(true,  "Enable break-even")
+beRR    = input.float(1.0,  "Move to BE at R multiple", step=0.1)
+beOff   = input.float(0.1,  "BE offset in ATR (>=0)", step=0.05, minval=0)
+
+useTrail= input.bool(true,  "Enable ATR trailing stop")
+trailATR= input.float(1.5,  "ATR multiple for trail", step=0.1, minval=0.5)
+
+// Track entry prices
+var float longEntry = na
+var float shortEntry= na
+
+// Calculate risk (R) from current bar perspective
+longRisk  = na(longEntry)  ? na : longEntry - longSL
+shortRisk = na(shortEntry) ? na : shortSL - shortEntry
+
+// Current BE prices
+beLongPrice  = na(longEntry)  or na(longRisk)  ? na : longEntry + beOff * atr
+beShortPrice = na(shortEntry) or na(shortRisk) ? na : shortEntry - beOff * atr
+
+// Trailing prices
+trailLong = close - trailATR * atr
+trailShort= close + trailATR * atr
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Orders
+//──────────────────────────────────────────────────────────────────────────────
+if longCond and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, qty_percent=riskPct)
+    longEntry := close
+    shortEntry := na
+
+if shortCond and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, qty_percent=riskPct)
+    shortEntry := close
+    longEntry := na
+
+// Exit management
+if strategy.position_size > 0
+    // Base SL/TP
+    sl = longSL
+    tp = longTP
+    // Break-even: when price ≥ entry + beRR * risk
+    if useBE and not na(longEntry)
+        reachedBE = (high >= longEntry + beRR * (longEntry - longSL))
+        sl := reachedBE ? math.max(sl, beLongPrice) : sl
+    // Trailing stop
+    if useTrail
+        sl := math.max(sl, trailLong)
+    strategy.exit("Long-Exit", from_entry="Long", stop=sl, limit=tp)
+
+if strategy.position_size < 0
+    sl = shortSL
+    tp = shortTP
+    if useBE and not na(shortEntry)
+        reachedBE = (low <= shortEntry - beRR * (shortSL - shortEntry))
+        sl := reachedBE ? math.min(sl, beShortPrice) : sl
+    if useTrail
+        sl := math.min(sl, trailShort)
+    strategy.exit("Short-Exit", from_entry="Short", stop=sl, limit=tp)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Alerts
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(longCond,  title="Long Signal (Entry)",  message="M15 Strategy: LONG on {{ticker}} @ {{close}}")
+alertcondition(shortCond, title="Short Signal (Entry)", message="M15 Strategy: SHORT on {{ticker}} @ {{close}}")
+closedLong  = ta.change(strategy.position_size) < 0  // long closed or reduced to flat
+closedShort = ta.change(strategy.position_size) > 0  // short closed or reduced to flat
+alertcondition(closedLong,  title="Long Exit",  message="M15 Strategy: LONG EXIT on {{ticker}} @ {{close}}")
+alertcondition(closedShort, title="Short Exit", message="M15 Strategy: SHORT EXIT on {{ticker}} @ {{close}}")
+
+//──────────────────────────────────────────────────────────────────────────────
+// ⌥ Visuals
+//──────────────────────────────────────────────────────────────────────────────
+plot(emaFast, "EMA Fast (M15)")
+plot(emaSlow, "EMA Slow (M15)")
+plot(vwap,    "VWAP")
+
+plotshape(longCond,  title="Long ▲",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, text="L")
+plotshape(shortCond, title="Short ▼", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="S")
+
+// Session shading
+bgcolor(useSessions and inLondon ? color.new(color.green, 92) : na)
+bgcolor(useSessions and inNewYork ? color.new(color.blue,  92) : na)
+
+// News blackout shading
+bgcolor(blockNow ? color.new(color.red, 88) : na)
+
+// Info label
+var label info = na
+if barstate.islast
+    label.delete(info)
+    txt = "M15 Gold/BTC/GJ Strategy\n" +
+          "Accuracy=" + str.tostring(accuracy, format.percent) +
+          " | H1 filter=" + str.tostring(useMTF) +
+          " | Trail xATR=" + str.tostring(trailATR) +
+          "\nSL %ATR=" + str.tostring(atrPctSL) + " | TP %ATR=" + str.tostring(atrPctTP) +
+          "\nSessions=" + (useSessions ? "ON" : "OFF") + " | NewsBlk=" + (useNewsBlk ? "ON" : "OFF")
+    info := label.new(bar_index, high, txt, style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 0))
+
+//──────────────────────────────────────────────────────────────────────────────
+// Notes:
+// - TradingView cannot auto-switch chart symbols; the symbol filter simply suppresses signals
+//   unless the chart symbol name includes XAU, BTC, or GBPJPY. Set to "Any" to run on any symbol.
+// - Manual news windows: enable and set UTC start/end for blackout periods (no new entries).
+// - Alerts: create one alert per condition you want (Long/Short Entry, Long/Short Exit).
+// - Accuracy slider relaxes thresholds (Stoch OB/OS, crossover tolerance, H1 slope).
+// - Risk sizing uses percent-of-equity (change in strategy properties or riskPct input).
